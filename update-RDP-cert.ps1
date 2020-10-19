@@ -287,13 +287,12 @@ function Convert-PemToPfx-2 {
 	#endregion
 	$ErrorActionPreference = "Stop"
 
-	$File = Get-Item $InputPath -Force -ErrorAction Stop
+	$Text = Get-Content -Path $InputPath -Raw -ErrorAction Stop
 	if ($KeyPath) {
 		$Key = Get-Item $KeyPath -Force -ErrorAction Stop
 	}
 
 	# parse content
-	$Text = Get-Content -Path $InputPath -Raw -ErrorAction Stop
 	Write-Debug "Extracting certificate information..."
 	$Cert = __extractCert $Text
 
