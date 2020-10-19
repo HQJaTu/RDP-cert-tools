@@ -114,7 +114,7 @@ Function Convert-HexToByteArray([String] $HexString) {
 
 .OUTPUTS
 	If input certificate matches expected certificate thumbprint, will return:
-	$None, $True;
+	$True, X509Certificate2;
 	
 	Otherwise:
 	Tuple of (Private key, Certificate) returned
@@ -126,8 +126,6 @@ Function Convert-HexToByteArray([String] $HexString) {
 .NOTES
 	On execution, unlike original code, this won't install private key of input certificate into certificate store.
 	See: https://github.com/PKISolutions/PSPKI/issues/64
-	
-	
 #>
 function Convert-PemToPfx-2 {
 [OutputType('[System.Security.Cryptography.X509Certificates.X509Certificate2]')]
@@ -177,36 +175,91 @@ function Convert-PemToPfx-2 {
 	function __composePRIVATEKEYBLOB($modulus, $PublicExponent, $PrivateExponent, $Prime1, $Prime2, $Exponent1, $Exponent2, $Coefficient) {
 		Write-Debug "Calculating key length."
 		$bitLen = "{0:X4}" -f $($modulus.Length * 8)
-		Write-Debug "Key length is $($modulus.Length * 8) bits."
+		$keyLen = $modulus.Length * 8
+		Write-Debug "RSA Key length is $keyLen bits."
 		[byte[]]$bitLen1 = Invoke-Expression 0x$([int]$bitLen.Substring(0,2))
 		[byte[]]$bitLen2 = Invoke-Expression 0x$([int]$bitLen.Substring(2,2))
 		[Byte[]]$PrivateKey = 0x07,0x02,0x00,0x00,0x00,0x24,0x00,0x00,0x52,0x53,0x41,0x32,0x00
 		[Byte[]]$PrivateKey = $PrivateKey + $bitLen1 + $bitLen2 + $PublicExponent + ,0x00 + `
 			$modulus + $Prime1 + $Prime2 + $Exponent1 + $Exponent2 + $Coefficient + $PrivateExponent
-		$PrivateKey
+		$keyLen, $PrivateKey
 	}
 	# returns RSACryptoServiceProvider for dispose purposes
-	function __attachPrivateKey($Cert, [Byte[]]$PrivateKey) {
+	function __attachRSAPrivateKey([System.Security.Cryptography.X509Certificates.X509Certificate2]$_Cert, $PrivateKeyLength, [Byte[]]$PrivateKey) {
 		$cspParams = New-Object Security.Cryptography.CspParameters -Property @{
 			ProviderName = $ProviderName
 			KeyContainerName = "pspki-" + [Guid]::NewGuid().ToString()
 			KeyNumber = [int]$KeySpec
 		}
-		$cspParams.Flags += [Security.Cryptography.CspProviderFlags]::UseMachineKeyStore
-		# Create new private-key file in filesystem:
-		$rsa = New-Object Security.Cryptography.RSACryptoServiceProvider -ArgumentList $cspParams
-		$rsa.ImportCspBlob($PrivateKey)
-		Write-Debug "__attachPrivateKey() set private key to a X509Certificate2"
-		# XXX old working!
-		#$Cert.PrivateKey = $rsa
+		Write-Debug "__attachRSAPrivateKey() set private key to a X509Certificate2"
 		if ($PSVersionTable.PSEdition -eq "Core") {
+			# .Net Core way of importing an RSA key is a complex one:
+
+			# $script:Cert.PrivateKey = $rsa will result in error:
+			# The property 'PrivateKey' cannot be found on this object. Verify that the property exists and can be set.
+
+			# Key locations are documented in: https://docs.microsoft.com/en-us/windows/win32/seccng/key-storage-and-retrieval
+			# CNG Machine store:
+			# %ALLUSERSPROFILE%\Application Data\Microsoft\Crypto\Keys
+			# Legacy Machine store:
+			# %PROGRAMDATA%\Microsoft\Crypto\RSA\MachineKeys
+			# Legacy User store:
+			# %APPDATA%\Microsoft\Crypto\RSA\S-1-5-21-...
+
+			# Step 1)
+			# Import the RSA key bytes using Cryptography Next Generation (CNG).
+
+			# Create Cng Key Parameter and set its properties to allow export.
+			# Make sure to store the key in Machine Store.
+			$cngKeyParameter = [System.Security.Cryptography.CngKeyCreationParameters]::new()
+			$cngKeyParameter.KeyUsage = [System.Security.Cryptography.CngKeyUsages]::AllUsages
+			$cngKeyParameter.ExportPolicy = [System.Security.Cryptography.CngExportPolicies]::AllowPlaintextExport
+			$cngKeyParameter.Provider = [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
+			$cngKeyParameter.UIPolicy = [System.Security.Cryptography.CngUIPolicy]::new([System.Security.Cryptography.CngUIProtectionLevels]::None)
+			$cngKeyParameter.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::MachineKey
+
+			# Create Cng Property for Length, set its value and add it to Cng Key Parameter
+			$cngKeyLenProperty = [System.Security.Cryptography.CngProperty]::new( `
+				"Length", `
+				[System.BitConverter]::GetBytes($PrivateKeyLength), `
+				[System.Security.Cryptography.CngPropertyOptions]::None)
+			$cngKeyParameter.Parameters.Add($cngKeyLenProperty)
+
+			# Create Cng Property for blob, set its value and add it to Cng Key Parameter
+			$keyBlobProperty = [System.Security.Cryptography.CngProperty]::new( `
+				[System.Security.Cryptography.CngKeyBlobFormat]::GenericPrivateBlob, `
+				$PrivateKey, `
+				[System.Security.Cryptography.CngPropertyOptions]::None)
+			$cngKeyParameter.Parameters.Add($keyBlobProperty)
+
+			# Create Cng Key for given $keyName using Rsa Algorithm
+			$rsaKey = [System.Security.Cryptography.CngKey]::Create([System.Security.Cryptography.CngAlgorithm]::Rsa, "AnRsaKey", $cngKeyParameter)
+			$rsa = New-Object Security.Cryptography.RSACng -ArgumentList $rsaKey
+
+			# To get the Unique container name in CNG:
+			# https://www.sysadmins.lv/blog-en/retrieve-cng-key-container-name-and-unique-name.aspx
+
+			# Step 2)
+			# Using CopyWithPrivateKey() glue the public and private keys together into a X.509 certificate.
+
             Add-Type -AssemblyName "System.Security.Cryptography.X509Certificates"
-            $script:Cert = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::CopyWithPrivateKey($_Cert.RawData, $rsa)
+            $script:Cert = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::CopyWithPrivateKey($_Cert, $rsa)
         } else {
+			# Trivial .Net way of importing an RSA key:
+
+			$cspParams.Flags += [Security.Cryptography.CspProviderFlags]::UseMachineKeyStore
+			# Create new private-key file in filesystem
+			# Note: Constructing a new RSACryptoServiceProvider-object will create a new private key file into filesystem.
+			# Note 2: RSACryptoServiceProvider is derived from System.Security.Cryptography.RSA
+			$rsa = New-Object Security.Cryptography.RSACryptoServiceProvider -ArgumentList $cspParams
+			$rsa.ImportCspBlob($PrivateKey)
+
             $script:Cert.PrivateKey = $rsa
         }
-
-		return $rsa, $Cert
+		if (!$script:cert.HasPrivateKey) {
+			throw "__attachRSAPrivateKey() Failed to attach private key into cert $($_Cert.Thumbprint). Cannot continue."
+		}
+		return $rsa, $script:Cert
 	}
 	# returns Asn1Reader
 	function __decodePkcs1($base64) {
@@ -232,29 +285,31 @@ function Convert-PemToPfx-2 {
 	}
 	#endregion
 	$ErrorActionPreference = "Stop"
-	
+
 	$File = Get-Item $InputPath -Force -ErrorAction Stop
 	if ($KeyPath) {
 		$Key = Get-Item $KeyPath -Force -ErrorAction Stop
 	}
-	
+
 	# parse content
 	$Text = Get-Content -Path $InputPath -Raw -ErrorAction Stop
 	Write-Debug "Extracting certificate information..."
 	$Cert = __extractCert $Text
-	
+
 	# Early abort here on existing X.509 cert thumbprint.
 	if ($ExistingThumbprint -and $Cert.Thumbprint -eq $ExistingThumbprint) {
-		return $None, $True;
+		return $True, $Cert;
 	}
 
-	# parse private key
+	# Parse private key
 	if ($Key) {$Text = Get-Content -Path $KeyPath -Raw -ErrorAction Stop}
 	$asn = if ($Text -match "(?msx).*-{5}BEGIN\sPRIVATE\sKEY-{5}(.+)-{5}END\sPRIVATE\sKEY-{5}") {
 		__decodePkcs8 $matches[1]
 	} elseif ($Text -match "(?msx).*-{5}BEGIN\sRSA\sPRIVATE\sKEY-{5}(.+)-{5}END\sRSA\sPRIVATE\sKEY-{5}") {
 		__decodePkcs1 $matches[1]
-	}  else {throw "The data is invalid."}
+	}  else {
+		throw "The private key data is invalid."
+	}
 	# private key version
 	if (!$asn.MoveNext()) {throw "The data is invalid."}
 	# modulus n
@@ -295,14 +350,18 @@ function Convert-PemToPfx-2 {
 	$Coefficient = __normalizeAsnInteger $asn.GetPayload()
 	Write-Debug "Coefficient length: $($Coefficient.Length)"
 	# creating Private Key BLOB structure
-	$PrivateKey = __composePRIVATEKEYBLOB $modulus $PublicExponent $PrivateExponent $Prime1 $Prime2 $Exponent1 $Exponent2 $Coefficient
+	$PrivateKeyLength, $PrivateKey = __composePRIVATEKEYBLOB $modulus $PublicExponent $PrivateExponent $Prime1 $Prime2 $Exponent1 $Exponent2 $Coefficient
 	
 	#region key attachment and export
 	try {
-		$rsaKey = __attachPrivateKey $Cert $PrivateKey
+		$rsaKey, $CertOut = __attachRSAPrivateKey $Cert $PrivateKeyLength $PrivateKey
 	} finally {
 		if ($rsaKey) {
-			$rsaKey[0].Dispose()
+			# XXX Needed?
+			# https://stackoverflow.com/q/56337434/1548275
+			# and:
+			# https://snede.net/the-most-dangerous-constructor-in-net/
+			#$rsaKey.Dispose()
 		}
 	}
 	if (!$rsaKey) {
@@ -310,34 +369,7 @@ function Convert-PemToPfx-2 {
 		Exit 1
 	}
 
-	return $rsaKey
-}
-
-
-<#
-.SYNOPSIS
-	(obsoleted) Get currently installed RDP-certificate from registry.
-
-.DESCRIPTION
-	A longer description.
-#>
-function GetCurrentValidRDPcertHash_Registry()
-{
-	$key = 'HKLM:\\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
-	$value = 'SSLCertificateSHA1Hash'
-	$regVal = Get-ItemProperty -Path $key -Name $value -ErrorAction SilentlyContinue;
-	Write-Debug "Reg ${key}\\${value}: $($regVal.SSLCertificateSHA1Hash)"
-	if (!$regVal) {
-		return $None;
-	}
-
-	$regHex = Convert-ByteArrayToHex $regVal.SSLCertificateSHA1Hash;
-	$existingCert = Get-ChildItem Cert:\LocalMachine\My | Where-Object -Property Thumbprint -EQ -Value $regHex;
-	if ($existingCert) {
-		return $regHex;
-	}
-
-	return $None;
+	return $rsaKey, $CertOut
 }
 
 
@@ -356,112 +388,31 @@ function GetCurrentValidRDPcertHash()
 		-Filter "TerminalName='RDP-tcp'";
 	Write-Debug "WMIC SSLCertificateSHA1Hash: $($tsSetting.SSLCertificateSHA1Hash)"
 	if (!$tsSetting) {
-		return $None;
+		return $None, $None;
 	}
 
+	# Attempt 1:
+	# Look for Local Machine's personal certificates. That's where newly installed custom certs go.
 	$existingCert = Get-ChildItem Cert:\LocalMachine\My | Where-Object -Property "Thumbprint" -EQ -Value $tsSetting.SSLCertificateSHA1Hash;
 	if ($existingCert) {
-		Write-Debug "Found RDP certificate with thumbprint: $($tsSetting.SSLCertificateSHA1Hash)";
+		Write-Debug "Found custom RDP certificate with thumbprint: $($tsSetting.SSLCertificateSHA1Hash)";
 		
-		return $tsSetting.SSLCertificateSHA1Hash;
+		return "My", $tsSetting.SSLCertificateSHA1Hash;
 	}
+
+	# Attempt 2:
+	# Look for Local Machine's Remote Desktop certificates. That's where machine generated self-signed certs go.
+	$existingCert = Get-ChildItem "Cert:\LocalMachine\Remote Desktop" | Where-Object -Property "Thumbprint" -EQ -Value $tsSetting.SSLCertificateSHA1Hash;
+	if ($existingCert) {
+		Write-Debug "Found Windows-generated self-signed RDP certificate with thumbprint: $($tsSetting.SSLCertificateSHA1Hash)";
+
+		return "Remote Desktop", $tsSetting.SSLCertificateSHA1Hash;
+	}
+
 
 	Write-Warning "No RDP certificate found with thumbprint: $($tsSetting.SSLCertificateSHA1Hash)";
 
-	return $None;
-}
-
-
-<#
-.SYNOPSIS
-	(obsoleted) Update RDP-certificate into certificate store if missing.
-
-.DESCRIPTION
-	A longer description.
-#>
-function ConfirmRDPRegistry([System.Security.Cryptography.X509Certificates.X509Certificate2]$cert)
-{
-	$key = 'HKLM:\\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
-	$value = 'SSLCertificateSHA1Hash'
-	$regVal = Get-ItemProperty -Path $key -Name $value -ErrorAction SilentlyContinue
-	Write-Debug "Reg ${key}\\${value}: $($regVal.SSLCertificateSHA1Hash)"
-	if (!$regVal) {
-		Write-Host "Adding certificate thumbprint to registry";
-		$regVal = New-ItemProperty -Path $key -Name $value -PropertyType Binary -Value (Convert-HexToByteArray $cert.Thumbprint);
-		return $True;
-	}
-	elseif ((Convert-ByteArrayToHex $regVal.SSLCertificateSHA1Hash) -ne $cert.Thumbprint) {
-		Write-Host "Updating certificate thumbprint in registry"
-		$regVal = Set-ItemProperty -Path $key -Name $value -Value (Convert-HexToByteArray $cert.Thumbprint)
-		return $True;
-	}
-
-	Write-Host "Registry has all good."
-	return $False;
-}
-
-
-<#
-.SYNOPSIS
-	(obsoleted) Update RDP-certificate if cert needs updating.
-
-.DESCRIPTION
-	A longer description.
-#>
-Function UpdateRDPCert_manual([System.Security.Cryptography.X509Certificates.X509Certificate2]$cert)
-{
-	# Confirm registry key for RDP cert
-	Write-Debug "Set RDP certificate hash to $($cert.Thumbprint)";
-	ConfirmRDPRegistry $cert | Out-Null;
-
-	# Confirm private key access permissions
-	Write-Debug "Confirm private key"
-	$rsaFile = $cert.PrivateKey.CspKeyContainerInfo.UniqueKeyContainerName;
-	if (!$rsaFile) {
-
-		Write-Host "Error: No private key name in X.509 cert. Failed!"
-		Exit 1
-	}
-	$keyPath = "$($env:ProgramData)\Microsoft\Crypto\RSA\MachineKeys\$rsaFile";
-	Write-Debug "Private key path is: $keyPath";
-	$acl = Get-Acl -Path $keyPath;
-
-	# Make sure Administrators-group has owner
-	$Group = New-Object System.Security.Principal.NTAccount -ArgumentList 'BUILTIN\Administrators';
-	$acl.SetOwner($Group);
-	Set-Acl -Path $keyPath -AclObject $acl;
-
-	# Add permission for NETWORK SERVICE to read the file
-	# NetworkServiceSid == "NT AUTHORITY\NETWORK SERVICE"
-	$sid = New-Object System.Security.Principal.SecurityIdentifier([System.Security.Principal.WellKnownSidType]::NetworkServiceSid, $null);
-	$permission = $sid, "Read", "Allow";
-	$accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule $permission;
-	$acl.AddAccessRule($accessRule);
-	#$acl | Format-List
-	Try
-	{
-		Set-Acl -Path $keyPath -AclObject $acl | Out-Null;
-		Write-Debug "Set ACL ok for private key file $keyPath"
-	}
-	Catch
-	{
-		Write-Error "Failed to set permission for NETWORK SERVICE"
-		Exit 1
-	}
-
-	# Restart RDP:
-	Write-Debug "Restarting RDP service to make sure all is good."
-	Restart-Service -DisplayName "Remote Desktop Services" -Force
-	Start-Sleep -Seconds 3
-	
-	
-	# Confirm registry key again (for debug purposes).
-	# Restarting "Remote Desktop Services" will delete the registry entry for custom certificate
-	# on any minor failure and fall back to a self-generated one.
-	if (ConfirmRDPRegistry $cert) {
-		Write-Host "Custom certificate setting to RDP failed!"
-		Exit 1
-	}
+	return $None, $None;
 }
 
 
@@ -473,26 +424,35 @@ Function UpdateRDPCert_manual([System.Security.Cryptography.X509Certificates.X50
 	Wmic docs:
 	https://docs.microsoft.com/en-us/windows/win32/wmisdk/wmic
 
+	Win32_TSGeneralSetting class docs:
+	https://docs.microsoft.com/en-us/windows/win32/termserv/win32-tsgeneralsetting
+
 .DESCRIPTION
 	This effectively does:
 	PS C:\> Write-Debug "Doing wmic with cert thumbprint: $certThumbprint"
 	PS C:\> wmic /namespace:"\\root\cimv2\TerminalServices" PATH "Win32_TSGeneralSetting" Set "SSLCertificateSHA1Hash=$certThumbprint"
 #>
-Function UpdateRDPCert($certThumbprint)
+Function UpdateRDPCert([System.Security.Cryptography.X509Certificates.X509Certificate2]$cert)
 {
-	# Replace Certificate for RDS using direct command. This works!
+	$certThumbprint = $cert.Thumbprint;
 
 	# Replace Certificate for RDS using Powershell cmdlet.
-	$tsSetting = Get-CimInstance -Class "Win32_TSGeneralSetting" `
-		-Namespace "root\cimv2\terminalservices" `
-		-Filter "TerminalName='RDP-tcp'";
+	$tsSetting = Get-CimInstance -ClassName 'Win32_TSGeneralSetting' `
+		-Namespace 'root\cimv2\terminalservices';
 
+	# Note:
+	# FullyQualifiedErrorId : HRESULT 0x80041008
+	# will be emitted, if certificate won't have a valid private key.
 	Write-Debug "Doing Set-WmiInstance with cert thumbprint: $certThumbprint"
 	# Docs: https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.management/set-wmiinstance
-	$updatedTsSetting = Set-CimInstance -InputObject $tsSetting `
-		-Argument @{SSLCertificateSHA1Hash=$certThumbprint};
+	$updatedTsSetting = Set-CimInstance -CimInstance $tsSetting `
+		-Property @{SSLCertificateSHA1Hash=$certThumbprint} `
+		-PassThru;
+	if (!$updatedTsSetting) {
+		Write-Host "Won't continue script execution.";
+		Exit 1;
+	}
 }
-
 
 
 # Begin script execution
@@ -501,10 +461,16 @@ if ($PSVersionTable.PSVersion.Major -gt 6) {
 
 	Exit 2
 }
+#$DebugPreference = "Continue";
 Write-Debug "Begin script execution"
 
-$currentRDPcertThumbprint = GetCurrentValidRDPcertHash;
-Write-Debug "Current RDP certificate thumbprint is: $currentRDPcertThumbprint"
+$currentRDPcertStore, $currentRDPcertThumbprint = GetCurrentValidRDPcertHash;
+if (!$currentRDPcertThumbprint) {
+	Write-Warning "Weird. No RDP certificate found at all."
+}
+else {
+	Write-Host "Currently installed RDP certificate thumbprint in store '$currentRDPcertStore' is: $currentRDPcertThumbprint"
+}
 
 if ($certPath -And $keyPath) {
 	# If filenames were given ...
@@ -518,36 +484,34 @@ if ($certPath -And $keyPath) {
 		Exit 2
 	}
 
-	#Write-Debug "Going to Convert-PemToPfx-2"
 	$privateKey, $cert = Convert-PemToPfx-2 -InputPath $certPath `
 		-KeyPath $keyPath `
 		-OutputPath $null `
 		-ExistingThumbprint $currentRDPcertThumbprint;
-	#Write-Debug "Did Convert-PemToPfx-2"
 
 	if (!$cert) {
 		throw "Failed to load certificate"
 	}
-	if ($cert -eq $True) {
+	if ($privateKey -eq $True) {
 		Write-Host "All ok. Certificate '$($cert.Subject)' with thumbprint $($cert.Thumbprint) already exists in cert store."
 		Exit 0
 	}
 	if (!$cert.HasPrivateKey) {
-		throw "Failed to load valid certificate"
+		throw "Failed to load valid certificate. No private key in cert $($cert.Thumbprint). Cannot continue."
 	}
 	#Write-Debug $cert
 	#Write-Debug $cert.Thumbprint
 	Write-Host "Loaded certificate with thumbprint $($cert.Thumbprint)";
-	
-	
+
+
 	# See:
 	# https://superuser.com/questions/1093159/how-to-provide-a-verified-server-certificate-for-remote-desktop-rdp-connection
 
 	# Check to see if the certificate is already installed
-	$storeName = "My";
-	$store = New-Object Security.Cryptography.X509Certificates.X509Store $storeName, "Local";
+	$store = New-Object Security.Cryptography.X509Certificates.X509Store "My", "Local";
 	$certInstalled = $False;
-	$store.Open("OpenExistingOnly");
+	$openFlags = [System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly -Bor [System.Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly
+	$store.Open($openFlags);
 	foreach ($existingCert in $store.Certificates) {
 		if ($existingCert.Thumbprint -eq $cert.Thumbprint) {
 			$certInstalled = $True;
@@ -557,14 +521,28 @@ if ($certPath -And $keyPath) {
 		}
 	}
 	$store.Close()
+
+	if (!$certInstalled) {
+		Write-Host "Installing certificate '$($cert.Subject)' to Windows Certificate Store";
+		$openFlags = [System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite
+		$store.Open($openFlags);
+		$store.Add($cert);
+		$store.Close();
+	}
+	else {
+		if ($currentRDPcertThumbprint -Ne $cert.Thumbprint) {
+			$certInstalled = $False;
+			Write-Host "Existing certificate '$($cert.Subject)' not used as RDP-certificate.";
+		}
+	}
 }
 elseif ($existingCertHash) {
 	# As filenames were not given, simply get the current one and confirm it is already installed.
 	# Find already installed certificate with given hash.
-	$storeName = "My";
-	$store = New-Object Security.Cryptography.X509Certificates.X509Store $storeName, "Local";
+	$store = New-Object Security.Cryptography.X509Certificates.X509Store "My", "Local";
 	$cert = $None;
 	$certInstalled = $False;
+	$openFlags = [System.Security.Cryptography.X509Certificates.OpenFlags]::ReadOnly -Bor [System.Security.Cryptography.X509Certificates.OpenFlags]::OpenExistingOnly
 	$store.Open("OpenExistingOnly");
 	foreach ($existingCert in $store.Certificates) {
 		if ($existingCert.Thumbprint -eq $existingCertHash) {
@@ -574,8 +552,9 @@ elseif ($existingCertHash) {
 		}
 	}
 	$store.Close();
-	
-	#
+
+	# Confirm there is a certificate.
+	# If yes, confirm it is different than the current one.
 	if (!$cert) {
 		Write-Host "Installed certificate with hash '$existingCertHash' cannot be found!";
 		Exit 1;
@@ -583,6 +562,9 @@ elseif ($existingCertHash) {
 	if ($currentRDPcertThumbprint -Eq $cert.Thumbprint) {
 		$certInstalled = $True;
 		Write-Host "RDP certificate is '$existingCertHash'. No need to install."
+	}
+	if (!$cert.HasPrivateKey) {
+		throw "Failed to locate valid certificate. No private key in cert $($cert.Thumbprint). Cannot continue."
 	}
 }
 else {
@@ -592,12 +574,7 @@ else {
 }
 
 if (!$certInstalled) {
-	Write-Host "Installing certificate '$($cert.Subject)' to RDP";
-	$store.Open("ReadWrite");
-	$store.Add($cert);
-	$store.Close();
-	
-	UpdateRDPCert $cert.Thumbprint;
+	UpdateRDPCert $cert;
 }
 
 # At end.

@@ -64,6 +64,17 @@ Installing certificate 'CN=*.example.com' to RDP
 All ok. RDP setup done.
 ```
 
+### Administrator permissions
+Lacking the required permissions:
+```
+.\update-RDP-cert.ps1 : The script 'update-RDP-cert.ps1' cannot be run because it contains a "#requires" statement for running as Administrator. The current PowerShell session is not running as Administrator. Start PowerShell by using the Run as Administrator option, and then try running the script again.
+At line:1 char:1
++ .\update-RDP-cert.ps1
++ ~~~~~~~~~~~~~~~~~~~~~
++ CategoryInfo          : PermissionDenied: (update-RDP-cert.ps1:String) [], ScriptRequiresException
++ FullyQualifiedErrorId : ScriptRequiresElevation
+```
+
 ### Idempotence
 Updating the certificate with same information is a no-op.
 
