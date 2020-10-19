@@ -254,6 +254,7 @@ function Convert-PemToPfx-2 {
 			$rsa = New-Object Security.Cryptography.RSACryptoServiceProvider -ArgumentList $cspParams
 			$rsa.ImportCspBlob($PrivateKey)
 
+			$script:Cert = $_Cert
             $script:Cert.PrivateKey = $rsa
         }
 		if (!$script:cert.HasPrivateKey) {
