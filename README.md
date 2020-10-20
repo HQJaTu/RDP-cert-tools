@@ -122,11 +122,11 @@ Enter passphrase for id_ecdsa-sha2-nistp521:
 Identity added: id_ecdsa-sha2-nistp521 (id_ecdsa-sha2-nistp521)
 ```
 
-## SSH in Windows
+## General information
+
+### SSH in Windows
 
 [Microsoft documentation of OpenSSH](https://docs.microsoft.com/en-us/windows-server/administration/openssh/openssh_overview)
-
-**Note:**
 
 Microsoft introduced OpenSSH into Windowsverse with release of version 1709 (Fall Creators Update) in September 26 2017.
 At the time, OpenSSH client was an optional feature.
@@ -134,5 +134,14 @@ At the time, OpenSSH client was an optional feature.
 Any Windows 10 version since Windows 10 1803 (April 2018 Update) has SSH and SSH-agent installed by default.
 This feature can obviouly be uninstalled, but any reasonable modern Windows 10 will have `ssh.exe` already installed.
 
-## PowerShell versions
+### PowerShell versions
 Scripts have been tested with PowerShell 5.x and PowerShell Core 6.x.
+
+PowerShell Core 7.x should work, but at this point is not tested.
+
+### Certificate types
+Remote Desktop Cervices can only operate with RSA-certificate.
+This requirement is not documented, but can be observed via testing.
+
+However, this tool is capable of importing also ECDSA-certificate.
+Future versions may support other certificate types too.
