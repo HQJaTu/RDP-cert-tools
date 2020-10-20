@@ -312,27 +312,6 @@ function Convert-PemToPfx-2 {
 			# Step 1)
 			# Import the ECC key bytes using Cryptography Next Generation (CNG).
 
-			if ($False) {
-				$cngKeyParameter2 = [System.Security.Cryptography.CngKeyCreationParameters]::new()
-				$cngKeyParameter2.KeyUsage = [System.Security.Cryptography.CngKeyUsages]::AllUsages
-				$cngKeyParameter2.ExportPolicy = [System.Security.Cryptography.CngExportPolicies]::AllowPlaintextExport
-				$cngKeyParameter2.Provider = [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
-				$cngKeyParameter2.UIPolicy = [System.Security.Cryptography.CngUIPolicy]::new([System.Security.Cryptography.CngUIProtectionLevels]::None)
-				#$cngKeyParameter2.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::MachineKey
-				$cngKeyParameter2.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::OverwriteExistingKey
-				$keyAlgo = [System.Security.Cryptography.CngAlgorithm]::ECDsaP384
-				$keyAlgo = [System.Security.Cryptography.CngAlgorithm]::ECDsaP521
-				$key = [System.Security.Cryptography.CngKey]::Create($keyAlgo, "anEccKey", $cngKeyParameter2);
-				Write-Debug "CngKey::Export(Pkcs8PrivateBlob)"
-				$exportedBytes = $key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
-				$dataHex = ($exportedBytes | ForEach-Object ToString X2) -join ''
-				Write-Debug "Export: $dataHex"
-				Write-Debug "CngKey::Export(EccPrivateBlob)"
-				$exportedBytes = $key.Export([System.Security.Cryptography.CngKeyBlobFormat]::EccPrivateBlob)
-				$PrivateKey = $exportedBytes
-				$dataHex = ($exportedBytes | ForEach-Object ToString X2) -join ''
-				Write-Debug "Export: $dataHex"
-			}
 			# Create Cng Key Parameter and set its properties to allow export.
 			# Make sure to store the key in Machine Store.
 			$cngKeyParameter = [System.Security.Cryptography.CngKeyCreationParameters]::new()
@@ -349,15 +328,6 @@ function Convert-PemToPfx-2 {
 					[System.Security.Cryptography.CngPropertyOptions]::None)
 			$cngKeyParameter.Parameters.Add($keyBlobProperty)
 
-			if ($False) {
-				Write-Debug "CngKey::Import(Pkcs8PrivateBlob)"
-				$key = [System.Security.Cryptography.CngKey]::Import(
-						$PrivateKey,
-						[System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob);
-				Write-Debug $key.ExportPolicy
-				Write-Debug $key.IsEphemeral
-				Write-Debug $key.IsMachineKey
-			}
 			# Create Cng Key for given $keyName using ECDsa Algorithm
 			Write-Debug "CngKey::Create(ECDsa)"
 			Switch ($PrivateKeyLen) {
