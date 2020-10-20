@@ -146,15 +146,16 @@ function Convert-PemToPfx-2 {
 		$Host.PrivateData.DebugForegroundColor = "Cyan"
 		$DebugPreference = "continue"
 	}
-	
-	#region helper functions
+
+#region helper functions
 	function __normalizeAsnInteger ($array) {
         $padding = $array.Length % 8
         if ($padding) {
             $array = $array[$padding..($array.Length - 1)]
         }
         [array]::Reverse($array)
-        [Byte[]]$array
+
+		return [Byte[]]$array
     }
 	function __extractCert([string]$Text) {
 		if ($Text -match "(?msx).*-{5}BEGIN\sCERTIFICATE-{5}(.+)-{5}END\sCERTIFICATE-{5}") {
@@ -168,11 +169,11 @@ function Convert-PemToPfx-2 {
 			}
 			Write-Debug "X.509 certificate is correct."
 		} else {
-			throw "Missing certificate file."
+			throw "X.509 certificate data doesn't look like a PEM-certificate."
 		}
 	}
 	# returns [byte[]]
-	function __composePRIVATEKEYBLOB($modulus, $PublicExponent, $PrivateExponent, $Prime1, $Prime2, $Exponent1, $Exponent2, $Coefficient) {
+	function __composeRsaPrivateKeyBlob($modulus, $PublicExponent, $PrivateExponent, $Prime1, $Prime2, $Exponent1, $Exponent2, $Coefficient) {
 		Write-Debug "Calculating key length."
 		$bitLen = "{0:X4}" -f $($modulus.Length * 8)
 		$keyLen = $modulus.Length * 8
@@ -182,18 +183,14 @@ function Convert-PemToPfx-2 {
 		[Byte[]]$PrivateKey = 0x07,0x02,0x00,0x00,0x00,0x24,0x00,0x00,0x52,0x53,0x41,0x32,0x00
 		[Byte[]]$PrivateKey = $PrivateKey + $bitLen1 + $bitLen2 + $PublicExponent + ,0x00 + `
 			$modulus + $Prime1 + $Prime2 + $Exponent1 + $Exponent2 + $Coefficient + $PrivateExponent
-		$keyLen, $PrivateKey
+
+		return $keyLen, $PrivateKey
 	}
-	# returns RSACryptoServiceProvider for dispose purposes
+	# returns RSACryptoServiceProvider/RSACng for dispose purposes
 	function __attachRSAPrivateKey([System.Security.Cryptography.X509Certificates.X509Certificate2]$_Cert, $PrivateKeyLength, [Byte[]]$PrivateKey) {
-		$cspParams = New-Object Security.Cryptography.CspParameters -Property @{
-			ProviderName = $ProviderName
-			KeyContainerName = "pspki-" + [Guid]::NewGuid().ToString()
-			KeyNumber = [int]$KeySpec
-		}
 		Write-Debug "__attachRSAPrivateKey() set private key to a X509Certificate2"
 		if ($PSVersionTable.PSEdition -eq "Core") {
-			# .Net Core way of importing an RSA key is a complex one:
+			# .Net Core way of importing a RSA key is a complex one:
 
 			# $script:Cert.PrivateKey = $rsa will result in error:
 			# The property 'PrivateKey' cannot be found on this object. Verify that the property exists and can be set.
@@ -233,7 +230,8 @@ function Convert-PemToPfx-2 {
 			$cngKeyParameter.Parameters.Add($keyBlobProperty)
 
 			# Create Cng Key for given $keyName using Rsa Algorithm
-			$rsaKey = [System.Security.Cryptography.CngKey]::Create([System.Security.Cryptography.CngAlgorithm]::Rsa, "AnRsaKey", $cngKeyParameter)
+			# Use X.509 thumbprint as unique name for this key
+			$rsaKey = [System.Security.Cryptography.CngKey]::Create([System.Security.Cryptography.CngAlgorithm]::Rsa, $_Cert.Thumbprint, $cngKeyParameter)
 			$rsa = New-Object Security.Cryptography.RSACng -ArgumentList $rsaKey
 
 			# To get the Unique container name in CNG:
@@ -247,6 +245,11 @@ function Convert-PemToPfx-2 {
         } else {
 			# Trivial .Net way of importing an RSA key:
 
+			$cspParams = New-Object Security.Cryptography.CspParameters -Property @{
+				ProviderName = $ProviderName
+				KeyContainerName = "pspki-" + [Guid]::NewGuid().ToString()
+				KeyNumber = [int]$KeySpec
+			}
 			$cspParams.Flags += [Security.Cryptography.CspProviderFlags]::UseMachineKeyStore
 			# Create new private-key file in filesystem
 			# Note: Constructing a new RSACryptoServiceProvider-object will create a new private key file into filesystem.
@@ -262,39 +265,286 @@ function Convert-PemToPfx-2 {
 		}
 		return $rsa, $script:Cert
 	}
+	# returns [byte[]]
+	function __composeEcDsaPrivateKeyBlob([UInt32]$PrivateKeyLen, [Byte[]]$PrivateKey, [Byte[]]$PublicKey) {
+		Write-Debug "ECDSA key length: $PrivateKeyLen bytes"
+
+		# Magic bytes. See: https://github.com/dotnet/corefx/blob/master/src/Common/src/Interop/Windows/BCrypt/Interop.Blobs.cs
+		Switch ($PrivateKeyLen) {
+			256 {
+				[Byte[]]$magic = 0x45,0x43,0x53,0x32
+				$PrivateKeyBytes = 256 / 8 # 32
+			}
+			384 {
+				[Byte[]]$magic = 0x45,0x43,0x53,0x34
+				$PrivateKeyBytes = 384 / 8 # 48
+			}
+			521 {
+				[Byte[]]$magic = 0x45,0x43,0x53,0x36
+				$PrivateKeyBytes = 66 # ceil(521 / 8)
+			}
+			default {
+				throw "Don't know how to handle ECC private key of size $PrivateKeyLen."
+			}
+		}
+
+		if ($PrivateKey.Length -Ne $PrivateKeyBytes) {
+			throw "ECDSA private key size mismatch! Expected to be $PrivateKeyBytes."
+		}
+		if ($PublicKey.Length -Ne $PrivateKeyBytes + $PrivateKeyBytes + 2) {
+			throw "ECDSA public key size mismatch! Expected to be $($PrivateKeyBytes + $PrivateKeyBytes + 2)."
+		}
+
+		[Byte[]]$keyLenBytes = [System.BitConverter]::GetBytes($PrivateKeyBytes)
+		[Byte[]]$PrivateKeyBytes = $magic + $keyLenBytes + `
+ 			($PublicKey | Select-Object -Skip 2) + `
+ 			$PrivateKey
+
+		return $PrivateKeyLen, $PrivateKeyBytes
+	}
+	# returns ECDsaCng for dispose purposes
+	function __attachECPrivateKey([System.Security.Cryptography.X509Certificates.X509Certificate2]$_Cert, `
+ 		[UInt32]$PrivateKeyLen, [Byte[]]$PrivateKey) {
+		Write-Debug "__attachECPrivateKey() set private key to a X509Certificate2"
+		if ($PSVersionTable.PSEdition -eq "Core") {
+			# .Net Core way of importing an EC key is a complex one:
+
+			# Step 1)
+			# Import the ECC key bytes using Cryptography Next Generation (CNG).
+
+			if ($False) {
+				$cngKeyParameter2 = [System.Security.Cryptography.CngKeyCreationParameters]::new()
+				$cngKeyParameter2.KeyUsage = [System.Security.Cryptography.CngKeyUsages]::AllUsages
+				$cngKeyParameter2.ExportPolicy = [System.Security.Cryptography.CngExportPolicies]::AllowPlaintextExport
+				$cngKeyParameter2.Provider = [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
+				$cngKeyParameter2.UIPolicy = [System.Security.Cryptography.CngUIPolicy]::new([System.Security.Cryptography.CngUIProtectionLevels]::None)
+				#$cngKeyParameter2.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::MachineKey
+				$cngKeyParameter2.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::OverwriteExistingKey
+				$keyAlgo = [System.Security.Cryptography.CngAlgorithm]::ECDsaP384
+				$keyAlgo = [System.Security.Cryptography.CngAlgorithm]::ECDsaP521
+				$key = [System.Security.Cryptography.CngKey]::Create($keyAlgo, "anEccKey", $cngKeyParameter2);
+				Write-Debug "CngKey::Export(Pkcs8PrivateBlob)"
+				$exportedBytes = $key.Export([System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob)
+				$dataHex = ($exportedBytes | ForEach-Object ToString X2) -join ''
+				Write-Debug "Export: $dataHex"
+				Write-Debug "CngKey::Export(EccPrivateBlob)"
+				$exportedBytes = $key.Export([System.Security.Cryptography.CngKeyBlobFormat]::EccPrivateBlob)
+				$PrivateKey = $exportedBytes
+				$dataHex = ($exportedBytes | ForEach-Object ToString X2) -join ''
+				Write-Debug "Export: $dataHex"
+			}
+			# Create Cng Key Parameter and set its properties to allow export.
+			# Make sure to store the key in Machine Store.
+			$cngKeyParameter = [System.Security.Cryptography.CngKeyCreationParameters]::new()
+			$cngKeyParameter.KeyUsage = [System.Security.Cryptography.CngKeyUsages]::AllUsages
+			$cngKeyParameter.ExportPolicy = [System.Security.Cryptography.CngExportPolicies]::AllowPlaintextExport
+			$cngKeyParameter.Provider = [System.Security.Cryptography.CngProvider]::MicrosoftSoftwareKeyStorageProvider
+			$cngKeyParameter.UIPolicy = [System.Security.Cryptography.CngUIPolicy]::new([System.Security.Cryptography.CngUIProtectionLevels]::None)
+			$cngKeyParameter.KeyCreationOptions = [System.Security.Cryptography.CngKeyCreationOptions]::MachineKey -Bor [System.Security.Cryptography.CngKeyCreationOptions]::OverwriteExistingKey
+
+			# Create Cng Property for blob, set its value and add it to Cng Key Parameter
+			$keyBlobProperty = [System.Security.Cryptography.CngProperty]::new( `
+					[System.Security.Cryptography.CngKeyBlobFormat]::EccPrivateBlob, `
+					$PrivateKey, `
+					[System.Security.Cryptography.CngPropertyOptions]::None)
+			$cngKeyParameter.Parameters.Add($keyBlobProperty)
+
+			if ($False) {
+				Write-Debug "CngKey::Import(Pkcs8PrivateBlob)"
+				$key = [System.Security.Cryptography.CngKey]::Import(
+						$PrivateKey,
+						[System.Security.Cryptography.CngKeyBlobFormat]::Pkcs8PrivateBlob);
+				Write-Debug $key.ExportPolicy
+				Write-Debug $key.IsEphemeral
+				Write-Debug $key.IsMachineKey
+			}
+			# Create Cng Key for given $keyName using ECDsa Algorithm
+			Write-Debug "CngKey::Create(ECDsa)"
+			Switch ($PrivateKeyLen) {
+				256 {
+					$algo = [System.Security.Cryptography.CngAlgorithm]::ECDsaP256
+				}
+				384 {
+					$algo = [System.Security.Cryptography.CngAlgorithm]::ECDsaP384
+				}
+				521 {
+					$algo = [System.Security.Cryptography.CngAlgorithm]::ECDsaP521
+				}
+				default {
+					throw "Don't know how to handle ECC private key of size $PrivateKeyLen."
+				}
+			}
+			# Use X.509 thumbprint as unique name for this key
+			$eccKey = [System.Security.Cryptography.CngKey]::Create($algo, $_Cert.Thumbprint, $cngKeyParameter)
+			Write-Debug "ECDsaCng::new(eccKey)"
+			$ecc = New-Object Security.Cryptography.ECDsaCng -ArgumentList $eccKey
+
+			# To get the Unique container name in CNG:
+			# https://www.sysadmins.lv/blog-en/retrieve-cng-key-container-name-and-unique-name.aspx
+
+			# Step 2)
+			# Using CopyWithPrivateKey() glue the public and private keys together into a X.509 certificate.
+
+			Add-Type -AssemblyName "System.Security.Cryptography.X509Certificates"
+			Write-Debug "ECDsaCertificateExtensions::CopyWithPrivateKey()"
+			$script:Cert = [Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::CopyWithPrivateKey($_Cert, $ecc)
+		} else {
+			throw "Reading EC-keys not implemented!"
+		}
+		if (!$script:cert.HasPrivateKey) {
+			Write-Error -ErrorAction Continue -Message "An error occurred!"
+			throw "__attachECPrivateKey() Failed to attach private key into cert $($_Cert.Thumbprint). Cannot continue."
+		}
+		return $ecc, $script:Cert
+	}
 	# returns Asn1Reader
 	function __decodePkcs1($base64) {
-		Write-Debug "Processing PKCS#1 RSA KEY module."
+		# See: https://tls.mbed.org/kb/cryptography/asn1-key-structures-in-der-and-pem
+		Write-Debug "Processing PKCS#1 KEY module."
 		$asn = New-Object SysadminsLV.Asn1Parser.Asn1Reader @(,[Convert]::FromBase64String($base64))
 		if ($asn.Tag -ne 48) {throw "The data is invalid."}
-		$asn
+
+		return $asn
 	}
 	# returns Asn1Reader
 	function __decodePkcs8($base64) {
+		# See: https://tls.mbed.org/kb/cryptography/asn1-key-structures-in-der-and-pem
 		Write-Debug "Processing PKCS#8 Private Key module."
 		$asn = New-Object SysadminsLV.Asn1Parser.Asn1Reader @(,[Convert]::FromBase64String($base64))
 		if ($asn.Tag -ne 48) {throw "The data is invalid."}
 		# version
 		if (!$asn.MoveNext()) {throw "The data is invalid."}
-		# algorithm identifier
+		# algorithm identifier, sequence
 		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		if ($asn.Tag -ne 48) {throw "The data is invalid."}
+		# algorithm identifier, field 1
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		$oidAlgo = [SysadminsLV.Asn1Parser.Asn1Utils]::DecodeObjectIdentifier($asn.GetTagRawData())
+		Write-Debug "Algorithm OID: $($oidAlgo.FriendlyName) = $($oidAlgo.Value)"
+		# algorithm identifier, field 2, ignored
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		if ($asn.Tag -Eq 6)
+		{
+			$oidAlgoParam = [SysadminsLV.Asn1Parser.Asn1Utils]::DecodeObjectIdentifier($asn.GetTagRawData())
+			Write-Debug "Parameter OID: $( $oidAlgoParam.FriendlyName ) = $( $oidAlgoParam.Value )"
+		} else {
+			$oidAlgoParam = $None
+			Write-Debug "Parameter OID: -none-"
+		}
 		# octet string
-		if (!$asn.MoveNextCurrentLevel()) {throw "The data is invalid."}
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
 		if ($asn.Tag -ne 4) {throw "The data is invalid."}
 		if (!$asn.MoveNext()) {throw "The data is invalid."}
-		$asn
+
+		return $asn, $oidAlgo, $oidAlgoParam
 	}
-	#endregion
+	function __rsaKeyFromAsn($asn) {
+		Write-Debug "Processing RSA private key"
+		# private key version
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		# modulus n
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		$modulus = __normalizeAsnInteger $asn.GetPayload()
+		Write-Debug "Modulus length: $($modulus.Length)"
+		# public exponent e
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		# public exponent must be 4 bytes exactly.
+		$PublicExponent = if ($asn.GetPayload().Length -eq 3) {
+			,0 + $asn.GetPayload()
+		} else {
+			$asn.GetPayload()
+		}
+		Write-Debug "PublicExponent length: $($PublicExponent.Length)"
+		# private exponent d
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		$PrivateExponent = __normalizeAsnInteger $asn.GetPayload()
+		Write-Debug "PrivateExponent length: $($PrivateExponent.Length)"
+		# prime1 p
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		$Prime1 = __normalizeAsnInteger $asn.GetPayload()
+		Write-Debug "Prime1 length: $($Prime1.Length)"
+		# prime2 q
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		$Prime2 = __normalizeAsnInteger $asn.GetPayload()
+		Write-Debug "Prime2 length: $($Prime2.Length)"
+		# exponent1 d mod (p-1)
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		$Exponent1 = __normalizeAsnInteger $asn.GetPayload()
+		Write-Debug "Exponent1 length: $($Exponent1.Length)"
+		# exponent2 d mod (q-1)
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		$Exponent2 = __normalizeAsnInteger $asn.GetPayload()
+		Write-Debug "Exponent2 length: $($Exponent2.Length)"
+		# coefficient (inverse of q) mod p
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		$Coefficient = __normalizeAsnInteger $asn.GetPayload()
+		Write-Debug "Coefficient length: $($Coefficient.Length)"
+		# creating Private Key BLOB structure
+		$PrivateKeyLength, $PrivateKey = __composeRsaPrivateKeyBlob $modulus $PublicExponent $PrivateExponent $Prime1 $Prime2 $Exponent1 $Exponent2 $Coefficient
+
+		return $PrivateKeyLength, $PrivateKey
+	}
+	function __eccKeyFromAsn($asn, $oid) {
+		Write-Debug "Processing EC private key"
+		Switch ($oid.FriendlyName) {
+			"ECDSA_P256" {
+				$PrivateKeyLength = 256
+			}
+			"ECDSA_P384" {
+				$PrivateKeyLength = 384
+			}
+			"ECDSA_P521" {
+				$PrivateKeyLength = 521
+			}
+			default {
+				throw "Don't know how to handle ECDSA key $($oid.FriendlyName)."
+			}
+		}
+
+		# all of the ASN.1 encoded data
+		# See: https://www.ietf.org/rfc/rfc5915.txt
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+
+		# version INTEGER { ecPrivkeyVer1(1) }
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		# privateKey OCTET STRING
+		$PrivateKey = $asn.GetPayload()
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		# parameters [0] ECParameters {{ NamedCurve }}
+		if (!$oid) {
+			if (!$asn.MoveNext()) {throw "The data is invalid."}
+			$oid = [SysadminsLV.Asn1Parser.Asn1Utils]::DecodeObjectIdentifier($asn.GetTagRawData())
+			Write-Debug "OID (PKCS#1): $($oid.FriendlyName) = $($oid.Value)"
+			if (!$asn.MoveNext()) {throw "The data is invalid."}
+		}
+		else {
+			Write-Debug "OID (PKCS#8): $($oid.FriendlyName) = $($oid.Value)"
+		}
+		# publicKey [1] BIT STRING
+		if (!$asn.MoveNext()) {throw "The data is invalid."}
+		if ($asn.Tag -ne 3) {throw "The data is invalid."}
+		$PublicKey = $asn.GetPayload()
+
+		$PrivateKeyBytes = __composeEcDsaPrivateKeyBlob $PrivateKeyLength $PrivateKey $PublicKey
+
+		return $PrivateKeyBytes
+	}
+#endregion
+
 	$ErrorActionPreference = "Stop"
 
-	$Text = Get-Content -Path $InputPath -Raw -ErrorAction Stop
-	if ($KeyPath) {
-		$Key = Get-Item $KeyPath -Force -ErrorAction Stop
+	if (-Not (Test-Path $InputPath -PathType Leaf)) {
+		throw "Certificate file $InputPath doesn't exist!"
 	}
+	if (-Not (Test-Path $KeyPath -PathType Leaf)) {
+		throw "Private key file $KeyPath doesn't exist!"
+	}
+
+	$FileContents = Get-Content -Path $InputPath -Raw -ErrorAction Stop
 
 	# parse content
 	Write-Debug "Extracting certificate information..."
-	$Cert = __extractCert $Text
+	$Cert = __extractCert $FileContents
 
 	# Early abort here on existing X.509 cert thumbprint.
 	if ($ExistingThumbprint -and $Cert.Thumbprint -eq $ExistingThumbprint) {
@@ -302,74 +552,63 @@ function Convert-PemToPfx-2 {
 	}
 
 	# Parse private key
-	if ($Key) {$Text = Get-Content -Path $KeyPath -Raw -ErrorAction Stop}
-	$asn = if ($Text -match "(?msx).*-{5}BEGIN\sPRIVATE\sKEY-{5}(.+)-{5}END\sPRIVATE\sKEY-{5}") {
-		__decodePkcs8 $matches[1]
-	} elseif ($Text -match "(?msx).*-{5}BEGIN\sRSA\sPRIVATE\sKEY-{5}(.+)-{5}END\sRSA\sPRIVATE\sKEY-{5}") {
-		__decodePkcs1 $matches[1]
-	}  else {
+	if ($KeyPath) {
+		$FileContents = Get-Content -Path $KeyPath -Raw -ErrorAction Stop
+	}
+	$oidAlgorithm = $None
+	$oidAlgoParam = $None
+	if ($FileContents -match "(?msx).*-{5}BEGIN\sPRIVATE\sKEY-{5}(.+)-{5}END\sPRIVATE\sKEY-{5}") {
+		$pkcs8Key = $matches[1]
+		$asn, $oidAlgorithm, $oidAlgoParam = __decodePkcs8 $pkcs8Key
+		if ($oidAlgorithm.FriendlyName -Eq 'RSA') {
+			$rsaAsn = $asn
+		} elseif ($oidAlgorithm.FriendlyName -Eq 'ECC') {
+			$eccAsn = $asn
+		} else {
+			throw "PKCS#8 private key is of type $($oidAlgorithm.FriendlyName), which cannot be handled by this app."
+		}
+	} elseif ($FileContents -match "(?msx).*-{5}BEGIN\sRSA\sPRIVATE\sKEY-{5}(.+)-{5}END\sRSA\sPRIVATE\sKEY-{5}") {
+		$rsaAsn = __decodePkcs1 $matches[1]
+	} elseif ($FileContents -match "(?msx).*-{5}BEGIN\sEC\sPRIVATE\sKEY-{5}(.+)-{5}END\sEC\sPRIVATE\sKEY-{5}") {
+		$eccAsn = __decodePkcs1 $matches[1]
+	} else {
 		throw "The private key data is invalid."
 	}
-	# private key version
-	if (!$asn.MoveNext()) {throw "The data is invalid."}
-	# modulus n
-	if (!$asn.MoveNext()) {throw "The data is invalid."}
-	$modulus = __normalizeAsnInteger $asn.GetPayload()
-	Write-Debug "Modulus length: $($modulus.Length)"
-	# public exponent e
-	if (!$asn.MoveNext()) {throw "The data is invalid."}
-	# public exponent must be 4 bytes exactly.
-	$PublicExponent = if ($asn.GetPayload().Length -eq 3) {
-		,0 + $asn.GetPayload()
-	} else {
-		$asn.GetPayload()
-	}
-	Write-Debug "PublicExponent length: $($PublicExponent.Length)"
-	# private exponent d
-	if (!$asn.MoveNext()) {throw "The data is invalid."}
-	$PrivateExponent = __normalizeAsnInteger $asn.GetPayload()
-	Write-Debug "PrivateExponent length: $($PrivateExponent.Length)"
-	# prime1 p
-	if (!$asn.MoveNext()) {throw "The data is invalid."}
-	$Prime1 = __normalizeAsnInteger $asn.GetPayload()
-	Write-Debug "Prime1 length: $($Prime1.Length)"
-	# prime2 q
-	if (!$asn.MoveNext()) {throw "The data is invalid."}
-	$Prime2 = __normalizeAsnInteger $asn.GetPayload()
-	Write-Debug "Prime2 length: $($Prime2.Length)"
-	# exponent1 d mod (p-1)
-	if (!$asn.MoveNext()) {throw "The data is invalid."}
-	$Exponent1 = __normalizeAsnInteger $asn.GetPayload()
-	Write-Debug "Exponent1 length: $($Exponent1.Length)"
-	# exponent2 d mod (q-1)
-	if (!$asn.MoveNext()) {throw "The data is invalid."}
-	$Exponent2 = __normalizeAsnInteger $asn.GetPayload()
-	Write-Debug "Exponent2 length: $($Exponent2.Length)"
-	# coefficient (inverse of q) mod p
-	if (!$asn.MoveNext()) {throw "The data is invalid."}
-	$Coefficient = __normalizeAsnInteger $asn.GetPayload()
-	Write-Debug "Coefficient length: $($Coefficient.Length)"
-	# creating Private Key BLOB structure
-	$PrivateKeyLength, $PrivateKey = __composePRIVATEKEYBLOB $modulus $PublicExponent $PrivateExponent $Prime1 $Prime2 $Exponent1 $Exponent2 $Coefficient
-	
-	#region key attachment and export
-	try {
-		$rsaKey, $CertOut = __attachRSAPrivateKey $Cert $PrivateKeyLength $PrivateKey
-	} finally {
-		if ($rsaKey) {
-			# XXX Needed?
-			# https://stackoverflow.com/q/56337434/1548275
-			# and:
-			# https://snede.net/the-most-dangerous-constructor-in-net/
-			#$rsaKey.Dispose()
-		}
-	}
-	if (!$rsaKey) {
-		Write-Host "Failed to create new cert!"
-		Exit 1
-	}
 
-	return $rsaKey, $CertOut
+	if ($rsaAsn) {
+		$PrivateKeyLength, $PrivateKey = __rsaKeyFromAsn $rsaAsn
+
+#region RSA key attachment and export
+		try {
+			$rsaKey, $CertOut = __attachRSAPrivateKey $Cert $PrivateKeyLength $PrivateKey
+		} finally {
+		}
+		if (!$rsaKey) {
+			Write-Host "Failed to create new cert!"
+			Exit 1
+		}
+#endregion
+
+		return $rsaKey, $CertOut
+	}
+	elseif ($eccAsn)
+	{
+		$PrivateKeyLength, $PrivateKey = __eccKeyFromAsn $eccAsn $oidAlgoParam
+
+#region ECC key attachment and export
+		try {
+			$ecdsaKey, $CertOut = __attachECPrivateKey $Cert $PrivateKeyLength $PrivateKey
+		} catch {
+			Write-Error -ErrorAction Continue -Message "An error occurred:`nException: $_`nStack trace: $($_.ScriptStackTrace)"
+		}
+		if (!$ecdsaKey) {
+			Write-Host "Failed to create new cert!"
+			Exit 1
+		}
+
+		return $ecdsaKey, $CertOut
+#endregion
+	}
 }
 
 
@@ -457,11 +696,11 @@ Function UpdateRDPCert([System.Security.Cryptography.X509Certificates.X509Certif
 
 # Begin script execution
 if ($PSVersionTable.PSVersion.Major -gt 6) {
+	# XXX ToDo: Test on PowerShell Core 7
 	Write-Host "This script will NOT work on Powershell version $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)!"
 
 	Exit 2
 }
-#$DebugPreference = "Continue";
 Write-Debug "Begin script execution"
 
 $currentRDPcertStore, $currentRDPcertThumbprint = GetCurrentValidRDPcertHash;
