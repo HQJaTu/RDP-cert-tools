@@ -47,8 +47,8 @@ DESCRIPTION
 Example:
 ```
 PS C:\> .\update-RDP-cert.ps1 `
-  -certPath '*.example.com.cer' `
-  -keyPath '*.example.com.key'
+  -certPath 'wildcard.example.com.cer' `
+  -keyPath 'wildcard.example.com.key'
 Installing certificate 'CN=*.example.com' to RDP
 All ok. RDP setup done.
 ```
