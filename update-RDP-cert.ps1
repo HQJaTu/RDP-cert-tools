@@ -22,7 +22,7 @@ under the License.
 #>
 
 # Powershell execution policy:
-# https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies?view=powershell-5.1
+# https://docs.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_execution_policies?view=powershell-7.1
 
 # Set-ExecutionPolicy Unrestricted -Scope CurrentUser
 
