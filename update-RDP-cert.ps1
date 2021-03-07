@@ -328,7 +328,6 @@ function Convert-PemToPfx-2 {
 					[System.Security.Cryptography.CngPropertyOptions]::None)
 			$cngKeyParameter.Parameters.Add($keyBlobProperty)
 
-			# Create Cng Key for given $keyName using ECDsa Algorithm
 			Write-Debug "CngKey::Create(ECDsa)"
 			Switch ($PrivateKeyLen) {
 				256 {
@@ -665,9 +664,8 @@ Function UpdateRDPCert([System.Security.Cryptography.X509Certificates.X509Certif
 
 
 # Begin script execution
-if ($PSVersionTable.PSVersion.Major -gt 6) {
-	# XXX ToDo: Test on PowerShell Core 7
-	Write-Host "This script will NOT work on Powershell version $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)!"
+if ($PSVersionTable.PSVersion.Major -ne 7) {
+	Write-Host "This script will NOT work on Powershell version $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)! Suggest installing ersion 7."
 
 	Exit 2
 }
