@@ -10,6 +10,14 @@ to a trusted root, a warning is issued before connecting.
 As the warning is being displayed every single time a connection is made,
 very soon any user will be annoyed.
 
+## Requirements
+* PowerShell Core 7
+  * Core 6 isn't supported. Code is likely to work, but supporting obsoleted versions is impossible.
+  * Non-Core -versions are not support and won't work.
+* PSPKI
+  * https://github.com/PKISolutions/PSPKI
+  * With _Administrator_ permissions, run `Install-Module -Name PSPKI`
+
 # Solution
 To suppress the warning, a properly trusted certificate can be used instead of the default self-signed one.
 
