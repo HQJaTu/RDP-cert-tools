@@ -51,6 +51,9 @@ PEM X.509 certificate path
  
 .PARAMETER certPath
 PEM X.509 private key path
+
+.PARAMETER rdpFilePath
+Optional path to an .rdp definition file to sign with rdpsign.exe using the RDP certificate
 #>
 Param(
     [Parameter(Mandatory=$True)]
@@ -71,7 +74,11 @@ Param(
 
     [Parameter(Mandatory=$True)]
     [string]
-    $remoteCertificatePath
+    $remoteCertificatePath,
+
+    [Parameter()]
+    [string]
+    $rdpFilePath
 )
 
 
@@ -235,7 +242,14 @@ catch {
 # Go execute the other script.
 Push-Location -Path $dir;
 try {
-	& .\update-RDP-cert.ps1 -certPath $certificateFile -keyPath $privateKeyFile
+	$updateArgs = @{
+		certPath = $certificateFile
+		keyPath  = $privateKeyFile
+	}
+	if ($rdpFilePath) {
+		$updateArgs.rdpFilePath = $rdpFilePath
+	}
+	& .\update-RDP-cert.ps1 @updateArgs
 }
 catch {
 	Remove-Item -LiteralPath $privateKeyFile -Force;

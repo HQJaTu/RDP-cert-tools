@@ -42,9 +42,15 @@ Script to set given PEM-formatted X.509 certificate and private key as RDP servi
  
 .PARAMETER certPath
 PEM X.509 certificate path
- 
-.PARAMETER certPath
+
+.PARAMETER keyPath
 PEM X.509 private key path
+
+.PARAMETER existingCertHash
+SHA1 thumbprint of an already installed certificate to use
+
+.PARAMETER rdpFilePath
+Optional path to an .rdp definition file to sign with rdpsign.exe using the RDP certificate
 #>
 param(
     [Parameter()]	# [Parameter(Mandatory=$True)]
@@ -57,7 +63,11 @@ param(
 
     [Parameter()]
     [string]
-    $existingCertHash
+    $existingCertHash,
+
+    [Parameter()]
+    [string]
+    $rdpFilePath
 )
 
 # Install required module for PKI
@@ -718,6 +728,46 @@ Function UpdateRDPCert([System.Security.Cryptography.X509Certificates.X509Certif
 }
 
 
+<#
+.SYNOPSIS
+	Sign an .rdp definition file with rdpsign.exe using the SHA256 thumbprint of the given certificate.
+
+.DESCRIPTION
+	Computes the SHA256 thumbprint of the supplied X.509 certificate and invokes:
+		rdpsign.exe /sha256 <thumbprint> <rdpFile>
+
+	The certificate must be installed in LocalMachine\My (or another store rdpsign.exe can read)
+	with its private key, otherwise rdpsign.exe will fail to produce a signature.
+
+.LINK
+	rdpsign docs:
+	https://learn.microsoft.com/en-us/windows-server/remote/remote-desktop-services/clients/rdp-files
+#>
+Function SignRDPFile([System.Security.Cryptography.X509Certificates.X509Certificate2]$cert, [string]$rdpFile)
+{
+	if (-Not (Test-Path $rdpFile -PathType Leaf)) {
+		throw "RDP file '$rdpFile' doesn't exist!"
+	}
+
+	$sha1Thumbprint = $cert.GetCertHashString([System.Security.Cryptography.HashAlgorithmName]::SHA1)
+	Write-Debug "SignRDPFile: Certificate SHA-1 thumbprint: $sha1Thumbprint"
+
+	$rdpsignPath = Join-Path -Path $env:SystemRoot -ChildPath "System32\rdpsign.exe"
+	if (-Not (Test-Path $rdpsignPath -PathType Leaf)) {
+		throw "rdpsign.exe not found at $rdpsignPath"
+	}
+
+	Write-Host "Signing RDP file '$rdpFile' using certificate $($cert.Thumbprint)";
+	# Note:
+	# Argument to use SHA-1 is /sha256
+	# Insanity!
+	& $rdpsignPath /sha256 $sha1Thumbprint $rdpFile
+	if ($LASTEXITCODE -ne 0) {
+		throw "rdpsign.exe failed with exit code $LASTEXITCODE"
+	}
+}
+
+
 # Begin script execution
 if ($PSVersionTable.PSVersion.Major -ne 7) {
 	Write-Host "This script will NOT work on Powershell version $($PSVersionTable.PSVersion.Major).$($PSVersionTable.PSVersion.Minor)! Suggest installing ersion 7."
@@ -776,6 +826,11 @@ namespace System.Security.Cryptography.X509Certificates {
 	}
 	if ($privateKey -eq $True) {
 		Write-Host "All ok. Certificate '$($cert.Subject)' with thumbprint $($cert.Thumbprint) already exists in cert store."
+
+		if ($rdpFilePath) {
+			SignRDPFile $cert $rdpFilePath;
+		}
+
 		Exit 0
 	}
 	if (!$cert.HasPrivateKey) {
@@ -857,6 +912,10 @@ else {
 
 if (!$certInstalled) {
 	UpdateRDPCert $cert;
+}
+
+if ($rdpFilePath) {
+	SignRDPFile $cert $rdpFilePath;
 }
 
 # At end.
