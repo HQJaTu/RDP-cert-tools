@@ -60,6 +60,20 @@ param(
     $existingCertHash
 )
 
+# Install required module for PKI
+if (-not (Get-Module -ListAvailable -Name PSPKI)) {
+    Write-Host "Module 'PSPKI' not found. Attempting to install..." -ForegroundColor Yellow
+
+    try {
+        Install-Module -Name PSPKI -Scope CurrentUser -AllowClobber -Force
+        Write-Host "Successfully installed 'PSPKI'." -ForegroundColor Green
+    }
+    catch {
+        Write-Error "Failed to install module 'PSPKI'. Error: $($_.Exception.Message)"
+        exit 2
+    }
+}
+
 Import-Module -Name PSPKI
 
 
@@ -624,6 +638,13 @@ function Convert-PemToPfx-2 {
 #>
 function GetCurrentValidRDPcertHash()
 {
+	if ((Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server").fDenyTSConnections -ne 0) {
+		Write-Warning "RDP server is not enabled. Suggest running two commands:";
+		Write-Warning "1) Set-ItemProperty -Path `"HKLM:\System\CurrentControlSet\Control\Terminal Server`" -Name fDenyTSConnections -Value 0";
+		Write-Warning "2) Enable-NetFirewallRule -DisplayGroup `"Remote Desktop`""
+		return $None, $None;
+	}
+	
 	$tsSetting = Get-CimInstance -Class "Win32_TSGeneralSetting" `
 		-Namespace "root\cimv2\terminalservices" `
 		-Filter "TerminalName='RDP-tcp'";
@@ -643,6 +664,7 @@ function GetCurrentValidRDPcertHash()
 
 	# Attempt 2:
 	# Look for Local Machine's Remote Desktop certificates. That's where machine generated self-signed certs go.
+	# XXX: "Cert:\LocalMachine\Remote Desktop" may not exist if RDP never run
 	$existingCert = Get-ChildItem "Cert:\LocalMachine\Remote Desktop" | Where-Object -Property "Thumbprint" -EQ -Value $tsSetting.SSLCertificateSHA1Hash;
 	if ($existingCert) {
 		Write-Debug "Found Windows-generated self-signed RDP certificate with thumbprint: $($tsSetting.SSLCertificateSHA1Hash)";
@@ -724,10 +746,30 @@ if ($certPath -And $keyPath) {
 		Exit 2
 	}
 
-	$privateKey, $cert = Convert-PemToPfx-2 -InputPath $certPath `
-		-KeyPath $keyPath `
-		-OutputPath $null `
-		-ExistingThumbprint $currentRDPcertThumbprint;
+    # Missing type?
+    if (-not ("System.Security.Cryptography.X509Certificates.X509KeySpecFlags" -as [type])) {
+        Add-Type @"
+namespace System.Security.Cryptography.X509Certificates {
+    public enum X509KeySpecFlags {
+        None = 0,
+        AT_KEYEXCHANGE = 1,
+        AT_SIGNATURE = 2
+    }
+}
+"@
+    }
+
+    # Go convert a PEM file into Pfx2
+    try {
+        $privateKey, $cert = Convert-PemToPfx-2 -InputPath $certPath `
+            -KeyPath $keyPath `
+            -OutputPath $null `
+            -ExistingThumbprint $currentRDPcertThumbprint;
+        }
+    catch {
+        Write-Error "Convert-PemToPfx-2 failed! Error: $($_.Exception.Message)"
+        exit 2
+    }
 
 	if (!$cert) {
 		throw "Failed to load certificate"

@@ -61,7 +61,7 @@ Param(
     [string]
     $serverUser,
 
-    [Parameter(Mandatory=$True)]
+    [Parameter()]
     [string]
     $serverAuthPrivateKeyPath,
 
@@ -91,10 +91,17 @@ Function Get-SFTPFile-OpenSSH([String]$hostname, [String]$username, [String]$pri
 
 	Write-Debug "Got: $userServerPath to $localFile"
 
-	$process = Start-Process -NoNewWindow -FilePath $sftpCommand `
-		-ArgumentList @("-i", $privateKeyFile, $userServerPath, $localFile) `
-		-PassThru `
-		-Wait
+	if ($privateKeyFile) {
+		$process = Start-Process -NoNewWindow -FilePath $sftpCommand `
+			-ArgumentList @("-i", $privateKeyFile, $userServerPath, $localFile) `
+			-PassThru `
+			-Wait
+	} else {
+		$process = Start-Process -NoNewWindow -FilePath $sftpCommand `
+			-ArgumentList @($userServerPath, $localFile) `
+			-PassThru `
+			-Wait
+	}
 	Write-Debug "SFTP exit code is: ${$process.ExitCode}"
 	
 	if ($process.ExitCode -gt 0) {
@@ -140,6 +147,56 @@ Function Confirm-SSH() {
 		Install-Module -Name -Name "Posh-SSH";
 	}
 }
+
+<#
+.SYNOPSIS
+	Get currently installed RDP-certificate via CIM-call.
+
+.DESCRIPTION
+	This effectively does:
+	PS C:\> wmic /namespace:"\\root\cimv2\TerminalServices" PATH "Win32_TSGeneralSetting" get "SSLCertificateSHA1Hash"
+#>
+function GetCurrentValidRDPcertHash()
+{
+	if ((Get-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server").fDenyTSConnections -ne 0) {
+		Write-Warning "RDP server is not enabled. Suggest running two commands:";
+		Write-Warning "1) Set-ItemProperty -Path `"HKLM:\System\CurrentControlSet\Control\Terminal Server`" -Name fDenyTSConnections -Value 0";
+		Write-Warning "2) Enable-NetFirewallRule -DisplayGroup `"Remote Desktop`""
+		return $None, $None;
+	}
+	
+	$tsSetting = Get-CimInstance -Class "Win32_TSGeneralSetting" `
+		-Namespace "root\cimv2\terminalservices" `
+		-Filter "TerminalName='RDP-tcp'";
+	Write-Debug "WMIC SSLCertificateSHA1Hash: $($tsSetting.SSLCertificateSHA1Hash)"
+	if (!$tsSetting) {
+		return $None, $None;
+	}
+
+	# Attempt 1:
+	# Look for Local Machine's personal certificates. That's where newly installed custom certs go.
+	$existingCert = Get-ChildItem Cert:\LocalMachine\My | Where-Object -Property "Thumbprint" -EQ -Value $tsSetting.SSLCertificateSHA1Hash;
+	if ($existingCert) {
+		Write-Debug "Found custom RDP certificate with thumbprint: $($tsSetting.SSLCertificateSHA1Hash)";
+		
+		return "My", $tsSetting.SSLCertificateSHA1Hash;
+	}
+
+	# Attempt 2:
+	# Look for Local Machine's Remote Desktop certificates. That's where machine generated self-signed certs go.
+	# XXX: "Cert:\LocalMachine\Remote Desktop" may not exist if RDP never run
+	$existingCert = Get-ChildItem "Cert:\LocalMachine\Remote Desktop" | Where-Object -Property "Thumbprint" -EQ -Value $tsSetting.SSLCertificateSHA1Hash;
+	if ($existingCert) {
+		Write-Debug "Found Windows-generated self-signed RDP certificate with thumbprint: $($tsSetting.SSLCertificateSHA1Hash)";
+
+		return "Remote Desktop", $tsSetting.SSLCertificateSHA1Hash;
+	}
+
+	Write-Warning "No RDP certificate found with thumbprint: $($tsSetting.SSLCertificateSHA1Hash)";
+
+	return $None, $None;
+}
+
 
 # Begin script execution
 #$DebugPreference = "continue";
@@ -191,6 +248,21 @@ catch {
 }
 finally {
 	Pop-Location
+}
+
+#
+$currentRDPcertStore, $currentRDPcertThumbprint = GetCurrentValidRDPcertHash;
+if ($currentRDPcertThumbprint) {
+	$cert = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Thumbprint -eq $currentRDPcertThumbprint }
+	if ($cert) {	
+		# Compute SHA256 (hex, no dashes)
+		$sha256Bytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)
+		$sha256Hex = ([System.BitConverter]::ToString($sha256Bytes)).Replace("-", "").ToUpper()
+		Write-Host "Cert SHA-1 160bit: $currentRDPcertThumbprint"
+		Write-Host "Cert SHA-2 256bit: $sha256Hex"
+	}
+} else {
+	Write-Warning "Weird. No RDP certificate found at all."
 }
 
 # Delete transferred material at the end.
