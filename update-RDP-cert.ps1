@@ -1,7 +1,7 @@
 #Requires -RunAsAdministrator
 
 <#
-Copyright (c) 2020 Jari Turkia (jatu@hqcodeshop.fi)
+Copyright (c) 2020-2026 Jari Turkia (jatu@hqcodeshop.fi)
  
 Licensed to the Apache Software Foundation (ASF) under one
 or more contributor license agreements.  See the NOTICE file
@@ -38,7 +38,20 @@ under the License.
 Script to set given PEM-formatted X.509 certificate and private key as RDP service certificate
  
 .DESCRIPTION
-Script to set given PEM-formatted X.509 certificate and private key as RDP service certificate
+Installs a custom X.509 certificate for Windows Remote Desktop Services.
+
+The certificate is either imported from PEM-formatted certificate and private key files
+(-certPath and -keyPath) into the Local Computer's Personal (LocalMachine\My) store, or an
+already installed certificate is selected by its SHA-1 thumbprint (-existingCertHash).
+The certificate is then set as the RDP-Tcp listener certificate.
+
+Running the script with the currently used certificate is a no-op.
+Running it without arguments displays the thumbprint of the currently installed RDP certificate.
+
+Optionally, an .rdp connection file can be signed with rdpsign.exe using the same certificate (-rdpFilePath).
+The file is signed even when the certificate itself did not need to be updated.
+
+Requires Administrator permissions, PowerShell 7 and the PSPKI module.
  
 .PARAMETER certPath
 PEM X.509 certificate path
@@ -730,11 +743,13 @@ Function UpdateRDPCert([System.Security.Cryptography.X509Certificates.X509Certif
 
 <#
 .SYNOPSIS
-	Sign an .rdp definition file with rdpsign.exe using the SHA256 thumbprint of the given certificate.
+	Sign an .rdp definition file with rdpsign.exe using the given certificate.
 
 .DESCRIPTION
-	Computes the SHA256 thumbprint of the supplied X.509 certificate and invokes:
+	Computes the SHA-1 thumbprint of the supplied X.509 certificate and invokes:
 		rdpsign.exe /sha256 <thumbprint> <rdpFile>
+
+	Despite its name, rdpsign.exe argument /sha256 expects the SHA-1 thumbprint.
 
 	The certificate must be installed in LocalMachine\My (or another store rdpsign.exe can read)
 	with its private key, otherwise rdpsign.exe will fail to produce a signature.

@@ -68,11 +68,24 @@ SYNOPSIS
 
 SYNTAX
     update-RDP-cert.ps1 [[-certPath] <String>] [[-keyPath] <String>]
-    [[-existingCertHash] <String>] [<CommonParameters>]
+    [[-existingCertHash] <String>] [[-rdpFilePath] <String>] [<CommonParameters>]
 
 
 DESCRIPTION
-    Script to set given PEM-formatted X.509 certificate and private key as RDP service certificate
+    Installs a custom X.509 certificate for Windows Remote Desktop Services.
+
+    The certificate is either imported from PEM-formatted certificate and private key files
+    (-certPath and -keyPath) into the Local Computer's Personal (LocalMachine\My) store, or an
+    already installed certificate is selected by its SHA-1 thumbprint (-existingCertHash).
+    The certificate is then set as the RDP-Tcp listener certificate.
+
+    Running the script with the currently used certificate is a no-op.
+    Running it without arguments displays the thumbprint of the currently installed RDP certificate.
+
+    Optionally, an .rdp connection file can be signed with rdpsign.exe using the same certificate (-rdpFilePath).
+    The file is signed even when the certificate itself did not need to be updated.
+
+    Requires Administrator permissions, PowerShell 7 and the PSPKI module.
 ```
 
 ### Display currently installed certificate SHA1-thumbprint
@@ -117,6 +130,34 @@ At line:1 char:1
 + FullyQualifiedErrorId : ScriptRequiresElevation
 ```
 
+### Signing an .rdp connection file
+Argument `-rdpFilePath` signs a Remote Desktop connection file with the installed RDP certificate.
+Internally function `SignRDPFile` runs Windows built-in `rdpsign.exe`:
+```
+rdpsign.exe /sha256 <SHA-1 thumbprint> <rdpFile>
+```
+**Note:** Despite the argument name `/sha256`, `rdpsign.exe` expects the SHA-1 thumbprint of the certificate.
+
+A signed .rdp-file lets the RDP-client verify who published the connection settings.
+Instead of the yellow _unknown publisher_ warning, the client displays the verified publisher name.
+For this to work, the client needs to trust the certificate chain, see [PKI Requirements](#pki-requirements).
+
+The .rdp-file is modified in place. Signing is done even if the certificate was already installed,
+thus the argument can be used together with `-certPath`/`-keyPath` or `-existingCertHash`.
+
+Example:
+```powershell
+PS C:\> .\update-RDP-cert.ps1 `
+  -existingCertHash f53500ed2f833251dccf992acbd4e6392978e391 `
+  -rdpFilePath 'C:\Users\Public\Desktop\server.example.com.rdp'
+RDP certificate is 'f53500ed2f833251dccf992acbd4e6392978e391'. No need to install.
+Signing RDP file 'C:\Users\Public\Desktop\server.example.com.rdp' using certificate f53500ed2f833251dccf992acbd4e6392978e391
+All ok. RDP setup done.
+```
+
+Signing fails if the file doesn't exist, the certificate lacks its private key,
+or `%SystemRoot%\System32\rdpsign.exe` is missing.
+
 ### Idempotence
 Updating the certificate with same information is a no-op.
 
@@ -149,6 +190,12 @@ PS C:\> .\get-RDP-cert.ps1 `
   -remotePrivateKeyPath 'certs/*.example.com/*.example.com.key' `
   -remoteCertificatePath 'certs/*.example.com/*.example.com.cer'
 ```
+
+After installation, SHA-1 and SHA-256 thumbprints of the RDP certificate are displayed.
+Transferred temporary files are always deleted.
+
+Argument `-rdpFilePath` is passed through to `update-RDP-cert.ps1`, see
+[Signing an .rdp connection file](#signing-an-rdp-connection-file).
 
 ### Using private keys with SSH-agent
 To suppress a passphrase request, private key can be imported before transfer.

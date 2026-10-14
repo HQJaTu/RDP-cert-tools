@@ -1,27 +1,24 @@
 #Requires -RunAsAdministrator
 
 <#
-The MIT License (MIT)
- 
-Copyright (c) 2020 Jari Turkia (jatu@hqcodeshop.fi)
- 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
- 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
- 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Copyright (c) 2020-2026 Jari Turkia (jatu@hqcodeshop.fi)
+
+Licensed to the Apache Software Foundation (ASF) under one
+or more contributor license agreements.  See the NOTICE file
+distributed with this work for additional information
+regarding copyright ownership.  The ASF licenses this file
+to you under the Apache License, Version 2.0 (the
+"License"); you may not use this file except in compliance
+with the License.  You may obtain a copy of the License at
+
+  http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing,
+software distributed under the License is distributed on an
+"AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+KIND, either express or implied.  See the License for the
+specific language governing permissions and limitations
+under the License.
 #>
 
 # Powershell execution policy:
@@ -34,23 +31,40 @@ SOFTWARE.
 
 <#
 .SYNOPSIS
-Script to set given PEM-formatted X.509 certificate and private key as RDP service certificate
+Script to download PEM-formatted X.509 certificate and private key via SFTP and set them as RDP service certificate
  
 .DESCRIPTION
-Script to set given PEM-formatted X.509 certificate and private key as RDP service certificate
+Wrapper for update-RDP-cert.ps1.
+
+Transfers a PEM-formatted X.509 certificate and its private key from a remote host using
+Windows OpenSSH sftp.exe into temporary files. Then update-RDP-cert.ps1 is executed to install
+the certificate as RDP service certificate. Finally, SHA-1 and SHA-256 thumbprints of the
+installed RDP certificate are displayed and the transferred temporary files are deleted.
+
+SSH authentication is done with the private key given in -serverAuthPrivateKeyPath or
+with any key loaded into OpenSSH Authentication Agent.
 
 If using passphrase protected private key:
-PS C:\> ssh-agent
+PS C:\> Start-Service ssh-agent
 PS C:\> ssh-add "key.file"
 
 Note: Fix for "unable to start ssh-agent service, error :1058" error:
 (as admin) Set-Service ssh-agent -StartupType Manual
  
-.PARAMETER certPath
-PEM X.509 certificate path
- 
-.PARAMETER certPath
-PEM X.509 private key path
+.PARAMETER serverHost
+SSH server hostname to transfer the files from
+
+.PARAMETER serverUser
+SSH username
+
+.PARAMETER serverAuthPrivateKeyPath
+Optional SSH private key file for authentication. If omitted, ssh-agent and default keys are used.
+
+.PARAMETER remotePrivateKeyPath
+Path of PEM X.509 private key file at the server
+
+.PARAMETER remoteCertificatePath
+Path of PEM X.509 certificate file at the server
 
 .PARAMETER rdpFilePath
 Optional path to an .rdp definition file to sign with rdpsign.exe using the RDP certificate
@@ -92,68 +106,43 @@ Note: Using scp it is not possible to specify destination filename.
 Function Get-SFTPFile-OpenSSH([String]$hostname, [String]$username, [String]$privateKeyFile,
 	[String]$remoteFile, [String]$localFile) {
 
-	$sftpCommand = "${env:systemroot}\System32\OpenSSH\sftp.exe";
-	# Properly escape argument filename.
-	$userServerPath = "`"${username}@${hostname}:'$remoteFile'" + '"'; # to keep text editor happy: '
+	$sftpCommand = "${env:systemroot}\System32\OpenSSH\sftp.exe"
 
-	Write-Debug "Got: $userServerPath to $localFile"
+	# Create temporary batch file for non-interactive execution
+    $batchFile = [System.IO.Path]::GetTempFileName()
+    "get `"$remoteFile`" `"$localFile`"" | Set-Content -Path $batchFile -Encoding ascii
 
-	if ($privateKeyFile) {
-		$process = Start-Process -NoNewWindow -FilePath $sftpCommand `
-			-ArgumentList @("-i", $privateKeyFile, $userServerPath, $localFile) `
-			-PassThru `
-			-Wait
-	} else {
-		$process = Start-Process -NoNewWindow -FilePath $sftpCommand `
-			-ArgumentList @($userServerPath, $localFile) `
-			-PassThru `
-			-Wait
-	}
-	Write-Debug "SFTP exit code is: ${$process.ExitCode}"
-	
-	if ($process.ExitCode -gt 0) {
-		throw "SFTP for file '$remoteFile' failed." 
-	}
+    try {
+        # Build argument array cleanly WITHOUT manual single-quote wrapping
+        $argList = @("-b", $batchFile)
+        
+        if ($privateKeyFile) {
+            $argList += "-i"
+            $argList += $privateKeyFile
+        }
+        
+        $argList += "${username}@${hostname}"
+
+        Write-Debug "EXEC CMD : $sftpCommand $($argList -join ' ')"
+
+        $process = Start-Process -NoNewWindow -FilePath $sftpCommand `
+            -ArgumentList $argList `
+            -PassThru `
+            -Wait
+
+        Write-Debug "SFTP exit code is: $($process.ExitCode)"
+        
+        if ($process.ExitCode -ne 0) {
+            throw "SFTP for file '$remoteFile' failed with exit code $($process.ExitCode)." 
+        }
+    }
+    finally {
+        if (Test-Path $batchFile) {
+            Remove-Item -Path $batchFile -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
-
-<#
-.SYNOPSIS
-Helper function to secure copy (SFTP) files from a server.
-
-Note: Using scp it is not possible to specify destination filename.
-      If *nix filename is not a valid filename in Windows, copy will fail.
-#>
-Function Get-SFTPFile-POSH([String]$hostname, [String]$username, [String]$privateKeyFile,
-	[String]$remoteFile, [String]$localFile) {
-
-	Write-Debug "Going to $hostname as $username"
-	Write-Debug "Using keyfile $privateKeyFile"
-	# Docs: https://github.com/darkoperator/Posh-SSH/blob/master/docs/Get-SCPFile.md
-	#$creds = ConvertTo-SecureString -String $username;
-	$keyPassphrase = 'ncLQ7s5I';
-	$creds = New-Object System.Management.Automation.PSCredential($username, $keyPassphrase)
-	#$creds = ConvertTo-SecureString -AsPlainText $username -Force
-	#$creds = Get-Credential -Message "Private key passphrase" -User $username;
-	$creds
-	Get-SCPFile -ComputerName $hostname `
-		-Credential $creds `
-		-KeyFile $privateKeyFile `
-		-RemoteFile $remoteFile `
-		-LocalFile $localFile;
-}
-
-
-<#
-.SYNOPSIS
-Helper function to confirm SSH module existence
-#>
-Function Confirm-SSH() {
-	$mod = Import-Module -Name "Posh-SSH" -ErrorAction:SilentlyContinue;
-	if (!$mod) {
-		Install-Module -Name -Name "Posh-SSH";
-	}
-}
 
 <#
 .SYNOPSIS
